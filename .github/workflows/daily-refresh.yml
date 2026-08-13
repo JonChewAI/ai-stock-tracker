@@ -1,0 +1,62 @@
+name: Daily refresh
+
+# 16:00 UTC == 00:00 Singapore time, every day.
+# Singapore has no daylight saving, so this is a fixed local time all year.
+on:
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # full history, so the rebase below has a merge base
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch end-of-day closes
+        env:
+          DATA_PROVIDER:        ${{ vars.DATA_PROVIDER || 'alphavantage' }}
+          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+          TWELVEDATA_API_KEY:   ${{ secrets.TWELVEDATA_API_KEY }}
+          FMP_API_KEY:          ${{ secrets.FMP_API_KEY }}
+        run: node refresh.mjs
+
+      - name: Commit snapshot if it changed
+        run: |
+          if [ -n "$(git status --porcelain data/)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/
+            git commit -m "data: daily refresh $(date -u +%Y-%m-%d)"
+            # A run takes ~6 minutes, so a human commit can land while it is
+            # fetching. Rebase onto whatever arrived rather than failing the run.
+            pushed=""
+            for attempt in 1 2 3; do
+              if git pull --rebase --autostash origin main && git push; then
+                pushed="yes"
+                break
+              fi
+              echo "push attempt $attempt lost the race, retrying"
+              sleep 5
+            done
+            if [ -z "$pushed" ]; then
+              echo "could not push after 3 attempts" >&2
+              exit 1
+            fi
+            echo "Snapshot committed - Vercel will redeploy."
+          else
+            echo "No change in data/, nothing to commit."
+          fi
